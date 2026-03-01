@@ -1,0 +1,42 @@
+{
+  "name": "zero-config-cli-bridge",
+  "version": "1.0.1",
+  "description": "Zero Setup. Zero API Keys. Expose your local authenticated CLIs as MCP tools.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "zero-config-cli-bridge": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"import('fs').then(({readFileSync,writeFileSync})=>{const p='dist/index.js';writeFileSync(p,'#!/usr/bin/env node\\n'+readFileSync(p,'utf8'))})\" && chmod +x dist/index.js",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "github",
+    "gh",
+    "cli",
+    "llm",
+    "claude",
+    "zero-config",
+    "agent",
+    "tool"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "@types/node": "^20.0.0"
+  }
+}
