@@ -8,25 +8,36 @@ import {
 import { executeCommand } from './executor.js';
 
 const MAX_JSON_ITEMS = 30;
-const TRUNCATION_MSG = `\n...[Output truncated at ${MAX_JSON_ITEMS} items. Use --limit or filters to narrow results.]`;
+const JSON_TRUNCATION_MSG = `\n...[Output truncated at ${MAX_JSON_ITEMS} items. Use --limit or filters to narrow results.]`;
+const MAX_TEXT_CHARS = 2000;
+const TEXT_TRUNCATION_MSG = '\n...[Output truncated. Use grep/jq to filter]';
 
 /**
- * Ensures the output returned to the LLM is always valid JSON.
- * If the output is a JSON array, caps it at MAX_JSON_ITEMS to prevent
- * context exhaustion. Falls back to raw text if parsing fails.
+ * Normalises command output for LLM consumption.
+ *
+ * JSON path  : caps array at MAX_JSON_ITEMS — always returns valid JSON.
+ * Text path  : caps at MAX_TEXT_CHARS — prevents context exhaustion on
+ *              error messages and plain-text fallback output.
+ *
+ * The executor's MAX_RAW_CHARS (4096) is an independent backstop that fires
+ * only if this function is somehow bypassed (e.g. future code paths).
  */
-function toJsonOutput(raw: string): string {
+function toSafeOutput(raw: string): string {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (Array.isArray(parsed)) {
       if (parsed.length > MAX_JSON_ITEMS) {
-        return JSON.stringify(parsed.slice(0, MAX_JSON_ITEMS), null, 2) + TRUNCATION_MSG;
+        return JSON.stringify(parsed.slice(0, MAX_JSON_ITEMS), null, 2) + JSON_TRUNCATION_MSG;
       }
       return JSON.stringify(parsed, null, 2);
     }
     return JSON.stringify(parsed, null, 2);
   } catch {
-    return raw; // non-JSON response (errors, etc.) returned as-is
+    // Non-JSON: error messages, plain text — apply character cap
+    if (raw.length > MAX_TEXT_CHARS) {
+      return raw.slice(0, MAX_TEXT_CHARS) + TEXT_TRUNCATION_MSG;
+    }
+    return raw;
   }
 }
 import { validateSubcommand, validateArgs } from './security.js';
@@ -84,7 +95,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   const raw = result.stdout || result.stderr || `(no output, exit code ${result.exitCode})`;
-  const output = toJsonOutput(raw);
+  const output = toSafeOutput(raw);
 
   return {
     content: [{ type: 'text', text: output }],

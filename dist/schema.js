@@ -1,13 +1,9 @@
 import { executeCommand } from './executor.js';
-const FALLBACK_FIELDS = {
-    'issue list': ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url'],
-    'pr list': ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url', 'baseRefName'],
-};
 /**
- * Fields known to work with the standard `repo` OAuth scope.
- * Excludes:
- *   - Fields requiring elevated scopes (e.g. `id` requires read:project)
- *   - `body` — issue/PR body text is unbounded and causes JSON truncation
+ * Fields requiring only the standard `repo` OAuth scope.
+ * Explicitly excludes:
+ *   - `id`    — requires read:project scope
+ *   - `body`  — unbounded text; breaks JSON item-level truncation
  */
 const REPO_SCOPE_SAFE_FIELDS = new Set([
     'number', 'title', 'state', 'labels', 'assignees',
@@ -17,51 +13,52 @@ const REPO_SCOPE_SAFE_FIELDS = new Set([
     'baseRefName', 'headRefName', 'headRepository', 'mergedAt', 'mergeCommit',
     'reviewDecision', 'additions', 'deletions', 'changedFiles',
 ]);
+const FALLBACK_FIELDS = {
+    'issue list': ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url'],
+    'pr list': ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url', 'baseRefName'],
+};
 /**
- * Queries the local gh binary for the JSON fields it supports for a given
- * subcommand. Uses an intentionally invalid field name to trigger gh's
- * "available fields" error message, then parses the response.
- *
- * Falls back to a known-safe static list if detection fails.
+ * Detects JSON fields available in the local gh binary by calling
+ * `gh <subcommand> --json` with no field argument. Recent gh versions
+ * output the available field list to stderr in this case — no error
+ * injection needed. Falls back to the static list on any failure.
  */
-async function probeJsonFields(subcommand) {
+async function detectJsonFields(subcommand) {
     const key = subcommand.join(' ');
     try {
-        const result = await executeCommand('gh', [
-            ...subcommand,
-            '--json', '__probe__',
-            '--limit', '0',
-        ]);
-        const text = result.stderr;
-        // gh outputs: `run 'gh issue list --json' to see available fields`
-        // then lists them, or lists inline after a colon.
-        const match = text.match(/available fields?[:\s]+([\s\S]+?)(?:\n\n|$)/i);
-        if (match) {
-            const fields = match[1]
-                .trim()
-                .split(/[\s,]+/)
+        // `gh issue list --json` with no fields causes gh to list available fields on stderr.
+        // This is documented behaviour, not error scraping.
+        const result = await executeCommand('gh', [...subcommand, '--json']);
+        const text = result.stderr + result.stdout;
+        // Output format: "Use `--json` with one or more of: field1,field2,..."
+        // or a newline-separated list after "Available fields:"
+        const commaMatch = text.match(/--json`?\s+with[^:]*:\s*([a-zA-Z,\s]+)/i);
+        if (commaMatch) {
+            const fields = commaMatch[1]
+                .split(/[,\s]+/)
                 .map((f) => f.trim())
                 .filter((f) => /^[a-zA-Z][a-zA-Z0-9]*$/.test(f))
-                .filter((f) => REPO_SCOPE_SAFE_FIELDS.has(f)); // exclude elevated-scope fields
+                .filter((f) => REPO_SCOPE_SAFE_FIELDS.has(f));
             if (fields.length > 0)
                 return fields;
         }
     }
     catch {
-        // gh not found or timed out — fall through to static
+        // gh not installed or timed out
     }
     return FALLBACK_FIELDS[key] ?? [];
 }
 export async function buildToolDefinitions() {
     const [issueFields, prFields] = await Promise.all([
-        probeJsonFields(['issue', 'list']),
-        probeJsonFields(['pr', 'list']),
+        detectJsonFields(['issue', 'list']),
+        detectJsonFields(['pr', 'list']),
     ]);
     return [
         {
             name: 'gh_issue_list',
             description: 'List GitHub issues as structured JSON. ' +
-                'Uses the local `gh` CLI and its existing authentication — no API key required.',
+                'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
+                'Read-only. Does not create, edit, or delete issues.',
             subcommand: ['issue', 'list'],
             jsonFields: issueFields,
             inputSchema: {
@@ -78,7 +75,8 @@ export async function buildToolDefinitions() {
         {
             name: 'gh_pr_list',
             description: 'List GitHub pull requests as structured JSON. ' +
-                'Uses the local `gh` CLI and its existing authentication — no API key required.',
+                'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
+                'Read-only. Does not create, edit, merge, or close pull requests.',
             subcommand: ['pr', 'list'],
             jsonFields: prFields,
             inputSchema: {
@@ -94,21 +92,25 @@ export async function buildToolDefinitions() {
         },
     ];
 }
-/** Builds the gh args array for direct spawn — no shell string, no injection surface. */
+/**
+ * Builds the gh args array using --flag=value notation throughout.
+ * This prevents option injection: a value starting with '-' cannot
+ * be misinterpreted as a separate flag by gh's argument parser.
+ */
 export function buildGhArgs(tool, args) {
-    const parts = [...tool.subcommand, '--json', tool.jsonFields.join(',')];
+    const parts = [...tool.subcommand, `--json=${tool.jsonFields.join(',')}`];
     if (args['repo'] !== undefined)
-        parts.push('--repo', String(args['repo']));
+        parts.push(`--repo=${String(args['repo'])}`);
     if (args['limit'] !== undefined)
-        parts.push('--limit', String(args['limit']));
+        parts.push(`--limit=${String(args['limit'])}`);
     if (args['state'] !== undefined)
-        parts.push('--state', String(args['state']));
+        parts.push(`--state=${String(args['state'])}`);
     if (args['label'] !== undefined && tool.name === 'gh_issue_list')
-        parts.push('--label', String(args['label']));
+        parts.push(`--label=${String(args['label'])}`);
     if (args['assignee'] !== undefined)
-        parts.push('--assignee', String(args['assignee']));
+        parts.push(`--assignee=${String(args['assignee'])}`);
     if (args['base'] !== undefined && tool.name === 'gh_pr_list')
-        parts.push('--base', String(args['base']));
+        parts.push(`--base=${String(args['base'])}`);
     return parts;
 }
 //# sourceMappingURL=schema.js.map

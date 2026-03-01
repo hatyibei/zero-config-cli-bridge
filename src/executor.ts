@@ -6,15 +6,16 @@ export interface ExecuteResult {
   exitCode: number;
 }
 
-// Raw character cap — fires only for non-JSON (error messages, plain text).
-// Structured JSON output is truncated at the item level in index.ts.
-const MAX_OUTPUT_CHARS = 10_000_000; // 10 MB hard ceiling
-const TRUNCATION_MSG = '\n...[Output truncated. Use grep/jq to filter]';
+// stdout carries structured JSON — large ceiling so index.ts can apply item-level truncation.
+const MAX_STDOUT_CHARS = 2_000_000; // 2 MB
+// stderr carries error messages and probe text — keep tight.
+const MAX_STDERR_CHARS = 4_096;
+const RAW_TRUNCATION_MSG = '\n...[Output truncated. Use grep/jq to filter]';
 const TIMEOUT_MS = 15_000;
 
-function truncate(s: string): string {
-  if (s.length <= MAX_OUTPUT_CHARS) return s;
-  return s.slice(0, MAX_OUTPUT_CHARS) + TRUNCATION_MSG;
+function truncate(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  return s.slice(0, limit) + RAW_TRUNCATION_MSG;
 }
 
 /**
@@ -42,8 +43,8 @@ export function executeCommand(bin: string, args: string[]): Promise<ExecuteResu
     proc.on('close', (code: number | null) => {
       clearTimeout(timer);
       resolve({
-        stdout: truncate(stdoutBuf),
-        stderr: truncate(stderrBuf),
+        stdout: truncate(stdoutBuf, MAX_STDOUT_CHARS),
+        stderr: truncate(stderrBuf, MAX_STDERR_CHARS),
         exitCode: code ?? 1,
       });
     });
