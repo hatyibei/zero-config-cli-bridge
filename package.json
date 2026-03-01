@@ -28,6 +28,14 @@
     "agent",
     "tool"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hatyibei/zero-config-cli-bridge"
+  },
+  "homepage": "https://github.com/hatyibei/zero-config-cli-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/hatyibei/zero-config-cli-bridge/issues"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20.0.0"
