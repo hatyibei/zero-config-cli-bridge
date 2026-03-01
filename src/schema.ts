@@ -1,4 +1,17 @@
-import { executeCommand } from './executor.js';
+/**
+ * Schema definitions for exposed gh tools.
+ *
+ * Field list design:
+ *   STATIC_FIELDS is the authoritative source of truth.
+ *   It contains only fields that work with the standard `repo` OAuth scope
+ *   and have been stable across gh major versions.
+ *
+ *   The probe (detectJsonFields) is NOT called at startup.
+ *   Rationale: the probe has no reliability guarantee — gh's output format
+ *   is human-readable and can change with any release. Running an unreliable
+ *   subprocess at every server start adds latency and timeout risk for zero
+ *   guaranteed gain. Static fields are the correct default.
+ */
 
 export interface ToolDefinition {
   name: string;
@@ -8,68 +21,26 @@ export interface ToolDefinition {
     properties: Record<string, { type: string; description: string }>;
     required?: string[];
   };
-  /** gh subcommand tokens, e.g. ['issue', 'list'] */
   subcommand: string[];
-  /** JSON fields confirmed available in the local gh binary, filtered to repo-scope-safe set */
   jsonFields: string[];
 }
 
-/**
- * Fields requiring only the standard `repo` OAuth scope.
- * Explicitly excludes:
- *   - `id`    — requires read:project scope
- *   - `body`  — unbounded text; breaks JSON item-level truncation
- */
-const REPO_SCOPE_SAFE_FIELDS: ReadonlySet<string> = new Set([
-  'number', 'title', 'state', 'labels', 'assignees',
-  'author', 'createdAt', 'updatedAt', 'closedAt', 'url',
-  'comments', 'milestone', 'isDraft', 'locked',
-  // PR-specific
-  'baseRefName', 'headRefName', 'headRepository', 'mergedAt', 'mergeCommit',
-  'reviewDecision', 'additions', 'deletions', 'changedFiles',
-]);
-
-const FALLBACK_FIELDS: Record<string, string[]> = {
-  'issue list': ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url'],
-  'pr list':    ['number', 'title', 'state', 'labels', 'assignees', 'createdAt', 'url', 'baseRefName'],
+// Fields verified against `gh issue list --json` and `gh pr list --json` output.
+// Excludes: `id` (requires read:project scope), `body` (unbounded text).
+const STATIC_FIELDS: Record<string, string[]> = {
+  'issue list': [
+    'number', 'title', 'state', 'labels', 'assignees',
+    'author', 'createdAt', 'updatedAt', 'closedAt', 'url',
+    'comments', 'milestone',
+  ],
+  'pr list': [
+    'number', 'title', 'state', 'labels', 'assignees',
+    'author', 'createdAt', 'updatedAt', 'closedAt', 'url',
+    'baseRefName', 'headRefName', 'isDraft', 'mergedAt', 'reviewDecision',
+  ],
 };
 
-/**
- * Detects JSON fields available in the local gh binary by calling
- * `gh <subcommand> --json` with no field argument. Recent gh versions
- * output the available field list to stderr in this case — no error
- * injection needed. Falls back to the static list on any failure.
- */
-async function detectJsonFields(subcommand: string[]): Promise<string[]> {
-  const key = subcommand.join(' ');
-  try {
-    // `gh issue list --json` with no fields causes gh to list available fields on stderr.
-    // This is documented behaviour, not error scraping.
-    const result = await executeCommand('gh', [...subcommand, '--json']);
-    const text = result.stderr + result.stdout;
-    // Output format: "Use `--json` with one or more of: field1,field2,..."
-    // or a newline-separated list after "Available fields:"
-    const commaMatch = text.match(/--json`?\s+with[^:]*:\s*([a-zA-Z,\s]+)/i);
-    if (commaMatch) {
-      const fields = commaMatch[1]
-        .split(/[,\s]+/)
-        .map((f) => f.trim())
-        .filter((f) => /^[a-zA-Z][a-zA-Z0-9]*$/.test(f))
-        .filter((f) => REPO_SCOPE_SAFE_FIELDS.has(f));
-      if (fields.length > 0) return fields;
-    }
-  } catch {
-    // gh not installed or timed out
-  }
-  return FALLBACK_FIELDS[key] ?? [];
-}
-
-export async function buildToolDefinitions(): Promise<ToolDefinition[]> {
-  const [issueFields, prFields] = await Promise.all([
-    detectJsonFields(['issue', 'list']),
-    detectJsonFields(['pr', 'list']),
-  ]);
-
+export function buildToolDefinitions(): ToolDefinition[] {
   return [
     {
       name: 'gh_issue_list',
@@ -78,7 +49,7 @@ export async function buildToolDefinitions(): Promise<ToolDefinition[]> {
         'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
         'Read-only. Does not create, edit, or delete issues.',
       subcommand: ['issue', 'list'],
-      jsonFields: issueFields,
+      jsonFields: STATIC_FIELDS['issue list'],
       inputSchema: {
         type: 'object',
         properties: {
@@ -97,7 +68,7 @@ export async function buildToolDefinitions(): Promise<ToolDefinition[]> {
         'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
         'Read-only. Does not create, edit, merge, or close pull requests.',
       subcommand: ['pr', 'list'],
-      jsonFields: prFields,
+      jsonFields: STATIC_FIELDS['pr list'],
       inputSchema: {
         type: 'object',
         properties: {
@@ -114,8 +85,8 @@ export async function buildToolDefinitions(): Promise<ToolDefinition[]> {
 
 /**
  * Builds the gh args array using --flag=value notation throughout.
- * This prevents option injection: a value starting with '-' cannot
- * be misinterpreted as a separate flag by gh's argument parser.
+ * Prevents option injection: a value starting with '-' cannot be
+ * misinterpreted as a separate flag by gh's argument parser.
  */
 export function buildGhArgs(tool: ToolDefinition, args: Record<string, unknown>): string[] {
   const parts: string[] = [...tool.subcommand, `--json=${tool.jsonFields.join(',')}`];
