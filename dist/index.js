@@ -3,42 +3,55 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, } from '@modelcontextprotocol/sdk/types.js';
 import { executeCommand } from './executor.js';
-const MAX_JSON_ITEMS = 30;
-const JSON_TRUNCATION_MSG = `\n...[Output truncated at ${MAX_JSON_ITEMS} items. Use --limit or filters to narrow results.]`;
-const MAX_TEXT_CHARS = 2000;
-const TEXT_TRUNCATION_MSG = '\n...[Output truncated. Use grep/jq to filter]';
-/**
- * Normalises command output for LLM consumption.
- *
- * JSON path  : caps array at MAX_JSON_ITEMS — always returns valid JSON.
- * Text path  : caps at MAX_TEXT_CHARS — prevents context exhaustion on
- *              error messages and plain-text fallback output.
- *
- * The executor's MAX_RAW_CHARS (4096) is an independent backstop that fires
- * only if this function is somehow bypassed (e.g. future code paths).
- */
-function toSafeOutput(raw) {
-    try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-            if (parsed.length > MAX_JSON_ITEMS) {
-                return JSON.stringify(parsed.slice(0, MAX_JSON_ITEMS), null, 2) + JSON_TRUNCATION_MSG;
-            }
-            return JSON.stringify(parsed, null, 2);
-        }
-        return JSON.stringify(parsed, null, 2);
-    }
-    catch {
-        // Non-JSON: error messages, plain text — apply character cap
-        if (raw.length > MAX_TEXT_CHARS) {
-            return raw.slice(0, MAX_TEXT_CHARS) + TEXT_TRUNCATION_MSG;
-        }
-        return raw;
-    }
-}
 import { validateSubcommand, validateArgs } from './security.js';
 import { buildToolDefinitions, buildGhArgs } from './schema.js';
-const server = new Server({ name: 'zero-config-cli-bridge', version: '1.1.0' }, { capabilities: { tools: {} } });
+const MAX_JSON_ITEMS = 30;
+const MAX_TEXT_CHARS = 2000;
+function toEnvelope(raw) {
+    // --- JSON path ---
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        // Non-JSON (error messages, plain text)
+        const text = raw.length > MAX_TEXT_CHARS
+            ? raw.slice(0, MAX_TEXT_CHARS) + '...[truncated]'
+            : raw;
+        return {
+            data: null,
+            meta: { truncated: raw.length > MAX_TEXT_CHARS, error: text },
+        };
+    }
+    // Array response: truncate at item level
+    if (Array.isArray(parsed)) {
+        const truncated = parsed.length > MAX_JSON_ITEMS;
+        const data = truncated ? parsed.slice(0, MAX_JSON_ITEMS) : parsed;
+        return {
+            data,
+            meta: {
+                truncated,
+                returnedItems: data.length,
+                ...(truncated
+                    ? { note: `Showing first ${MAX_JSON_ITEMS} items. Use --limit or filters to narrow results.` }
+                    : {}),
+            },
+        };
+    }
+    // Non-array JSON object: cap by serialised size
+    const serialised = JSON.stringify(parsed);
+    if (serialised.length > MAX_TEXT_CHARS) {
+        return {
+            data: null,
+            meta: {
+                truncated: true,
+                error: `Response object too large (${serialised.length} chars). Use filters to narrow results.`,
+            },
+        };
+    }
+    return { data: parsed, meta: { truncated: false } };
+}
+const server = new Server({ name: 'zero-config-cli-bridge', version: '1.3.0' }, { capabilities: { tools: {} } });
 let toolRegistry = new Map();
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: Array.from(toolRegistry.values()).map(({ name, description, inputSchema }) => ({
@@ -52,10 +65,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args = (rawArgs ?? {});
     const tool = toolRegistry.get(toolName);
     if (!tool) {
-        return {
-            content: [{ type: 'text', text: `Error: Unknown tool "${toolName}".` }],
-            isError: true,
+        const envelope = {
+            data: null,
+            meta: { truncated: false, error: `Unknown tool "${toolName}".` },
         };
+        return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }], isError: true };
     }
     // Security: whitelist subcommand + validate arg values
     try {
@@ -63,10 +77,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         validateArgs(args);
     }
     catch (err) {
-        return {
-            content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }],
-            isError: true,
+        const envelope = {
+            data: null,
+            meta: { truncated: false, error: err instanceof Error ? err.message : String(err) },
         };
+        return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }], isError: true };
     }
     // Direct spawn — no shell, no injection surface
     const ghArgs = buildGhArgs(tool, args);
@@ -75,20 +90,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         result = await executeCommand('gh', ghArgs);
     }
     catch (err) {
-        return {
-            content: [{ type: 'text', text: `Execution error: ${err instanceof Error ? err.message : String(err)}` }],
-            isError: true,
+        const envelope = {
+            data: null,
+            meta: { truncated: false, error: `Execution error: ${err instanceof Error ? err.message : String(err)}` },
         };
+        return { content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }], isError: true };
     }
-    const raw = result.stdout || result.stderr || `(no output, exit code ${result.exitCode})`;
-    const output = toSafeOutput(raw);
+    const raw = result.stdout || result.stderr || '';
+    const envelope = toEnvelope(raw);
     return {
-        content: [{ type: 'text', text: output }],
+        content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
         isError: result.exitCode !== 0,
     };
 });
 async function main() {
-    // Probe local gh binary for available capabilities before accepting requests
     const tools = await buildToolDefinitions();
     toolRegistry = new Map(tools.map((t) => [t.name, t]));
     const transport = new StdioServerTransport();
