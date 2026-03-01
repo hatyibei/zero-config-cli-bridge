@@ -2,23 +2,33 @@
  * Security layer.
  *
  * With direct spawn(bin, args[]) there is no shell to inject into.
- * This layer provides defense-in-depth by:
- *   1. Whitelisting the exact subcommand paths allowed to execute.
- *   2. Validating individual argument values for anomalous content.
+ * This layer provides defence-in-depth:
+ *   1. Whitelists the exact subcommand paths allowed to execute.
+ *   2. Associates each subcommand with an operation tier.
+ *   3. Validates individual argument values for anomalous content.
+ *
+ * Tiers:
+ *   0  READ          — executes immediately, no approval
+ *   2  WRITE         — blocks until human approves via TTY
+ *   3  IRREVERSIBLE  — never executes; not exposed as tools
  */
 
-/** Only these gh subcommand paths may execute. */
-const ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set([
-  'issue list',
-  'pr list',
+export type OperationTier = 0 | 2 | 3;
+
+const SUBCOMMAND_TIERS: ReadonlyMap<string, OperationTier> = new Map([
+  ['issue list',    0],
+  ['pr list',       0],
+  ['issue create',  2],
+  ['pr create',     2],
+  ['issue comment', 2],
 ]);
 
-export function validateSubcommand(subcommand: string): void {
-  if (!ALLOWED_SUBCOMMANDS.has(subcommand)) {
-    throw new Error(
-      `Error: Subcommand "${subcommand}" is not in the read-only allow-list.`
-    );
+export function getOperationTier(subcommand: string): OperationTier {
+  const tier = SUBCOMMAND_TIERS.get(subcommand);
+  if (tier === undefined) {
+    throw new Error(`Error: Subcommand "${subcommand}" is not in the allow-list.`);
   }
+  return tier;
 }
 
 export function validateArgs(args: Record<string, unknown>): void {

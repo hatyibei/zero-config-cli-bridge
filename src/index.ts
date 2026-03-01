@@ -6,17 +6,13 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { executeCommand } from './executor.js';
-import { validateSubcommand, validateArgs } from './security.js';
-import { buildToolDefinitions, buildGhArgs, ToolDefinition } from './schema.js';
+import { getOperationTier, validateArgs } from './security.js';
+import { buildToolDefinitions, buildGhArgs, buildCommandPreview, ToolDefinition } from './schema.js';
+import { requestApproval } from './approval.js';
 
 const MAX_JSON_ITEMS = 30;
-const MAX_SERIALISED_CHARS = 200_000; // 200 KB cap for non-array JSON objects
+const MAX_SERIALISED_CHARS = 200_000;
 
-/**
- * Response envelope — every tool call returns this shape.
- * The full response is always valid, parseable JSON.
- * Truncation metadata is carried inside the structure.
- */
 interface ToolEnvelope {
   data: unknown;
   meta: {
@@ -28,11 +24,8 @@ interface ToolEnvelope {
 }
 
 /**
- * Converts gh stdout (JSON) into a bounded, always-valid envelope.
- * Called only when exitCode === 0.
- *
- * stdout is passed unmodified from executor — no byte-level truncation
- * has occurred. item-level truncation is the sole guard here.
+ * Converts gh stdout (always JSON when --json flag is used) into a bounded envelope.
+ * Called only on exitCode === 0.
  */
 function stdoutToEnvelope(stdout: string): ToolEnvelope {
   if (!stdout.trim()) {
@@ -43,17 +36,12 @@ function stdoutToEnvelope(stdout: string): ToolEnvelope {
   try {
     parsed = JSON.parse(stdout);
   } catch {
-    // gh returned non-JSON despite --json flag (should not happen in normal operation)
     return {
       data: null,
-      meta: {
-        truncated: false,
-        error: `Unexpected non-JSON output from gh: ${stdout.slice(0, 200)}`,
-      },
+      meta: { truncated: false, error: `Unexpected non-JSON output: ${stdout.slice(0, 200)}` },
     };
   }
 
-  // Array response: truncate at item level — primary case for list commands
   if (Array.isArray(parsed)) {
     const truncated = parsed.length > MAX_JSON_ITEMS;
     const data = truncated ? parsed.slice(0, MAX_JSON_ITEMS) : parsed;
@@ -69,43 +57,43 @@ function stdoutToEnvelope(stdout: string): ToolEnvelope {
     };
   }
 
-  // Non-array JSON object: guard against unbounded size
+  // Non-array (e.g. single created resource from write command)
   const serialised = JSON.stringify(parsed);
   if (serialised.length > MAX_SERIALISED_CHARS) {
     return {
       data: null,
-      meta: {
-        truncated: true,
-        error: `Response object too large (${serialised.length} chars). Use filters to narrow results.`,
-      },
+      meta: { truncated: true, error: `Response too large (${serialised.length} chars).` },
     };
   }
 
   return { data: parsed, meta: { truncated: false } };
 }
 
-/**
- * Wraps an error string in the standard envelope.
- * stderr is already bounded to 4KB by executor.
- */
 function stderrToEnvelope(stderr: string, stdout: string): ToolEnvelope {
   const error = (stderr || stdout || 'Command failed with no output').trim();
   return { data: null, meta: { truncated: false, error } };
 }
 
-function envelopeToResponse(envelope: ToolEnvelope, isError: boolean) {
+function envelopeResponse(envelope: ToolEnvelope, isError: boolean) {
   return {
     content: [{ type: 'text', text: JSON.stringify(envelope, null, 2) }],
     isError,
   };
 }
 
-// Tool registry is synchronously populated at startup — no subprocess calls.
+function errorEnvelope(message: string) {
+  return envelopeResponse(
+    { data: null, meta: { truncated: false, error: message } },
+    true,
+  );
+}
+
+// Tool registry populated synchronously at startup — no subprocess overhead.
 const tools = buildToolDefinitions();
 const toolRegistry = new Map<string, ToolDefinition>(tools.map((t) => [t.name, t]));
 
 const server = new Server(
-  { name: 'zero-config-cli-bridge', version: '1.4.0' },
+  { name: 'zero-config-cli-bridge', version: '2.0.0' },
   { capabilities: { tools: {} } }
 );
 
@@ -122,45 +110,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = (rawArgs ?? {}) as Record<string, unknown>;
 
   const tool = toolRegistry.get(toolName);
-  if (!tool) {
-    return envelopeToResponse(
-      { data: null, meta: { truncated: false, error: `Unknown tool "${toolName}".` } },
-      true,
-    );
-  }
+  if (!tool) return errorEnvelope(`Unknown tool "${toolName}".`);
 
-  // Security: whitelist subcommand + validate arg values
+  // Security: verify subcommand is in allow-list and get its tier
+  let tier: 0 | 2 | 3;
   try {
-    validateSubcommand(tool.subcommand.join(' '));
     validateArgs(args);
+    tier = getOperationTier(tool.subcommand.join(' '));
   } catch (err) {
-    return envelopeToResponse(
-      { data: null, meta: { truncated: false, error: err instanceof Error ? err.message : String(err) } },
-      true,
-    );
+    return errorEnvelope(err instanceof Error ? err.message : String(err));
   }
 
-  // Direct spawn — no shell, no injection surface
-  const ghArgs = buildGhArgs(tool, args);
+  // Tier 3: never executes (not exposed as tools, but guard defensively)
+  if (tier === 3) {
+    return errorEnvelope('Irreversible operations are not permitted.');
+  }
 
+  // Tier 2: block until human physically approves at the terminal
+  if (tier === 2) {
+    const preview = buildCommandPreview(tool, args);
+    const approved = await requestApproval(preview);
+    if (!approved) {
+      return errorEnvelope('Operation denied by human operator.');
+    }
+  }
+
+  // Execute — direct spawn, no shell
+  const ghArgs = buildGhArgs(tool, args);
   let result;
   try {
     result = await executeCommand('gh', ghArgs);
   } catch (err) {
-    return envelopeToResponse(
-      { data: null, meta: { truncated: false, error: `Execution error: ${err instanceof Error ? err.message : String(err)}` } },
-      true,
-    );
+    return errorEnvelope(`Execution error: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  // stdout and stderr are semantically distinct:
-  //   exitCode === 0 → stdout is structured JSON data; stderr is ignored warnings
-  //   exitCode !== 0 → stderr is the error message; stdout is typically empty
   if (result.exitCode !== 0) {
-    return envelopeToResponse(stderrToEnvelope(result.stderr, result.stdout), true);
+    return envelopeResponse(stderrToEnvelope(result.stderr, result.stdout), true);
   }
 
-  return envelopeToResponse(stdoutToEnvelope(result.stdout), false);
+  return envelopeResponse(stdoutToEnvelope(result.stdout), false);
 });
 
 async function main() {

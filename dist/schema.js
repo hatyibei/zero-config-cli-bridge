@@ -1,20 +1,6 @@
-/**
- * Schema definitions for exposed gh tools.
- *
- * Field list design:
- *   STATIC_FIELDS is the authoritative source of truth.
- *   It contains only fields that work with the standard `repo` OAuth scope
- *   and have been stable across gh major versions.
- *
- *   The probe (detectJsonFields) is NOT called at startup.
- *   Rationale: the probe has no reliability guarantee — gh's output format
- *   is human-readable and can change with any release. Running an unreliable
- *   subprocess at every server start adds latency and timeout risk for zero
- *   guaranteed gain. Static fields are the correct default.
- */
-// Fields verified against `gh issue list --json` and `gh pr list --json` output.
+// Fields verified against `gh issue list --json` and `gh pr list --json`.
 // Excludes: `id` (requires read:project scope), `body` (unbounded text).
-const STATIC_FIELDS = {
+const READ_FIELDS = {
     'issue list': [
         'number', 'title', 'state', 'labels', 'assignees',
         'author', 'createdAt', 'updatedAt', 'closedAt', 'url',
@@ -26,15 +12,22 @@ const STATIC_FIELDS = {
         'baseRefName', 'headRefName', 'isDraft', 'mergedAt', 'reviewDecision',
     ],
 };
+// Fields returned by write commands (small, bounded — single created resource)
+const WRITE_RESPONSE_FIELDS = {
+    'issue create': ['number', 'url', 'title', 'state'],
+    'pr create': ['number', 'url', 'title', 'state', 'baseRefName', 'headRefName'],
+    'issue comment': ['url', 'body'],
+};
 export function buildToolDefinitions() {
     return [
+        // ── Tier 0: Read ────────────────────────────────────────────────────────
         {
             name: 'gh_issue_list',
             description: 'List GitHub issues as structured JSON. ' +
-                'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
-                'Read-only. Does not create, edit, or delete issues.',
+                'Read-only — executes immediately without approval.',
             subcommand: ['issue', 'list'],
-            jsonFields: STATIC_FIELDS['issue list'],
+            tier: 0,
+            jsonFields: READ_FIELDS['issue list'],
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -49,10 +42,10 @@ export function buildToolDefinitions() {
         {
             name: 'gh_pr_list',
             description: 'List GitHub pull requests as structured JSON. ' +
-                'Uses the local `gh` CLI and its existing authentication — no API key required. ' +
-                'Read-only. Does not create, edit, merge, or close pull requests.',
+                'Read-only — executes immediately without approval.',
             subcommand: ['pr', 'list'],
-            jsonFields: STATIC_FIELDS['pr list'],
+            tier: 0,
+            jsonFields: READ_FIELDS['pr list'],
             inputSchema: {
                 type: 'object',
                 properties: {
@@ -64,6 +57,66 @@ export function buildToolDefinitions() {
                 },
             },
         },
+        // ── Tier 2: Write (requires human TTY approval) ──────────────────────────
+        {
+            name: 'gh_issue_create',
+            description: 'Create a GitHub issue. ' +
+                '⚠️  WRITE OPERATION — blocks until a human approves at the terminal. ' +
+                'Uses local `gh` authentication. Requires title.',
+            subcommand: ['issue', 'create'],
+            tier: 2,
+            jsonFields: WRITE_RESPONSE_FIELDS['issue create'],
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    title: { type: 'string', description: 'Issue title (required).' },
+                    body: { type: 'string', description: 'Issue body text.' },
+                    repo: { type: 'string', description: 'OWNER/REPO. Omit to use current directory.' },
+                    label: { type: 'string', description: 'Label name to apply.' },
+                    assignee: { type: 'string', description: 'Assignee login.' },
+                },
+                required: ['title'],
+            },
+        },
+        {
+            name: 'gh_pr_create',
+            description: 'Create a GitHub pull request. ' +
+                '⚠️  WRITE OPERATION — blocks until a human approves at the terminal. ' +
+                'Uses local `gh` authentication. Requires title.',
+            subcommand: ['pr', 'create'],
+            tier: 2,
+            jsonFields: WRITE_RESPONSE_FIELDS['pr create'],
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    title: { type: 'string', description: 'PR title (required).' },
+                    body: { type: 'string', description: 'PR body text.' },
+                    base: { type: 'string', description: 'Base branch (default: repo default branch).' },
+                    head: { type: 'string', description: 'Head branch (default: current branch).' },
+                    repo: { type: 'string', description: 'OWNER/REPO. Omit to use current directory.' },
+                    draft: { type: 'boolean', description: 'Open as draft PR.' },
+                },
+                required: ['title'],
+            },
+        },
+        {
+            name: 'gh_issue_comment',
+            description: 'Add a comment to a GitHub issue. ' +
+                '⚠️  WRITE OPERATION — blocks until a human approves at the terminal. ' +
+                'Uses local `gh` authentication. Requires issue number and body.',
+            subcommand: ['issue', 'comment'],
+            tier: 2,
+            jsonFields: WRITE_RESPONSE_FIELDS['issue comment'],
+            inputSchema: {
+                type: 'object',
+                properties: {
+                    issue: { type: 'number', description: 'Issue number (required).' },
+                    body: { type: 'string', description: 'Comment text (required).' },
+                    repo: { type: 'string', description: 'OWNER/REPO. Omit to use current directory.' },
+                },
+                required: ['issue', 'body'],
+            },
+        },
     ];
 }
 /**
@@ -72,19 +125,71 @@ export function buildToolDefinitions() {
  * misinterpreted as a separate flag by gh's argument parser.
  */
 export function buildGhArgs(tool, args) {
-    const parts = [...tool.subcommand, `--json=${tool.jsonFields.join(',')}`];
-    if (args['repo'] !== undefined)
-        parts.push(`--repo=${String(args['repo'])}`);
-    if (args['limit'] !== undefined)
-        parts.push(`--limit=${String(args['limit'])}`);
-    if (args['state'] !== undefined)
-        parts.push(`--state=${String(args['state'])}`);
-    if (args['label'] !== undefined && tool.name === 'gh_issue_list')
-        parts.push(`--label=${String(args['label'])}`);
-    if (args['assignee'] !== undefined)
-        parts.push(`--assignee=${String(args['assignee'])}`);
-    if (args['base'] !== undefined && tool.name === 'gh_pr_list')
-        parts.push(`--base=${String(args['base'])}`);
+    const parts = [...tool.subcommand];
+    // All tools request JSON output for structured responses
+    if (tool.jsonFields && tool.jsonFields.length > 0) {
+        parts.push(`--json=${tool.jsonFields.join(',')}`);
+    }
+    switch (tool.name) {
+        case 'gh_issue_list':
+            if (args['repo'])
+                parts.push(`--repo=${String(args['repo'])}`);
+            if (args['limit'])
+                parts.push(`--limit=${String(args['limit'])}`);
+            if (args['state'])
+                parts.push(`--state=${String(args['state'])}`);
+            if (args['label'])
+                parts.push(`--label=${String(args['label'])}`);
+            if (args['assignee'])
+                parts.push(`--assignee=${String(args['assignee'])}`);
+            break;
+        case 'gh_pr_list':
+            if (args['repo'])
+                parts.push(`--repo=${String(args['repo'])}`);
+            if (args['limit'])
+                parts.push(`--limit=${String(args['limit'])}`);
+            if (args['state'])
+                parts.push(`--state=${String(args['state'])}`);
+            if (args['base'])
+                parts.push(`--base=${String(args['base'])}`);
+            if (args['assignee'])
+                parts.push(`--assignee=${String(args['assignee'])}`);
+            break;
+        case 'gh_issue_create':
+            parts.push(`--title=${String(args['title'])}`);
+            if (args['body'])
+                parts.push(`--body=${String(args['body'])}`);
+            if (args['repo'])
+                parts.push(`--repo=${String(args['repo'])}`);
+            if (args['label'])
+                parts.push(`--label=${String(args['label'])}`);
+            if (args['assignee'])
+                parts.push(`--assignee=${String(args['assignee'])}`);
+            break;
+        case 'gh_pr_create':
+            parts.push(`--title=${String(args['title'])}`);
+            if (args['body'])
+                parts.push(`--body=${String(args['body'])}`);
+            if (args['base'])
+                parts.push(`--base=${String(args['base'])}`);
+            if (args['head'])
+                parts.push(`--head=${String(args['head'])}`);
+            if (args['repo'])
+                parts.push(`--repo=${String(args['repo'])}`);
+            if (args['draft'])
+                parts.push('--draft');
+            break;
+        case 'gh_issue_comment':
+            parts.push(String(args['issue']));
+            parts.push(`--body=${String(args['body'])}`);
+            if (args['repo'])
+                parts.push(`--repo=${String(args['repo'])}`);
+            break;
+    }
     return parts;
+}
+/** Human-readable preview of the command an agent intends to execute */
+export function buildCommandPreview(tool, args) {
+    return 'gh ' + buildGhArgs(tool, args).join(' ');
 }
 //# sourceMappingURL=schema.js.map
