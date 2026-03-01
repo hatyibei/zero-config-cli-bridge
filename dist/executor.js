@@ -1,29 +1,31 @@
 import { spawn } from 'child_process';
-const MAX_OUTPUT = 2000;
+// Raw character cap — fires only for non-JSON (error messages, plain text).
+// Structured JSON output is truncated at the item level in index.ts.
+const MAX_OUTPUT_CHARS = 10_000_000; // 10 MB hard ceiling
 const TRUNCATION_MSG = '\n...[Output truncated. Use grep/jq to filter]';
-const TIMEOUT_MS = 3000;
-function truncate(output) {
-    if (output.length <= MAX_OUTPUT)
-        return output;
-    return output.slice(0, MAX_OUTPUT) + TRUNCATION_MSG;
+const TIMEOUT_MS = 15_000;
+function truncate(s) {
+    if (s.length <= MAX_OUTPUT_CHARS)
+        return s;
+    return s.slice(0, MAX_OUTPUT_CHARS) + TRUNCATION_MSG;
 }
-export function executeCommand(command) {
+/**
+ * Executes a binary directly with an args array.
+ * NO shell intermediary — shell injection is structurally impossible.
+ */
+export function executeCommand(bin, args) {
     return new Promise((resolve, reject) => {
-        const proc = spawn('sh', ['-c', command], {
+        const proc = spawn(bin, args, {
             env: { ...process.env, CI: 'true' },
             stdio: ['ignore', 'pipe', 'pipe'],
         });
         let stdoutBuf = '';
         let stderrBuf = '';
-        proc.stdout.on('data', (chunk) => {
-            stdoutBuf += chunk.toString();
-        });
-        proc.stderr.on('data', (chunk) => {
-            stderrBuf += chunk.toString();
-        });
+        proc.stdout.on('data', (chunk) => { stdoutBuf += chunk.toString(); });
+        proc.stderr.on('data', (chunk) => { stderrBuf += chunk.toString(); });
         const timer = setTimeout(() => {
             proc.kill('SIGKILL');
-            reject(new Error(`Command timed out after ${TIMEOUT_MS}ms: ${command}`));
+            reject(new Error(`Command timed out after ${TIMEOUT_MS}ms`));
         }, TIMEOUT_MS);
         proc.on('close', (code) => {
             clearTimeout(timer);

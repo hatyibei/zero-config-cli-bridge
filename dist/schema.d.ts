@@ -9,7 +9,12 @@ export interface ToolDefinition {
         }>;
         required?: string[];
     };
+    /** gh subcommand tokens, e.g. ['issue', 'list'] */
+    subcommand: string[];
+    /** JSON fields confirmed available in the local gh binary */
+    jsonFields: string[];
 }
-export declare function getToolDefinitions(): ToolDefinition[];
-export declare function buildGhCommand(toolName: string, args: Record<string, unknown>): string;
+export declare function buildToolDefinitions(): Promise<ToolDefinition[]>;
+/** Builds the gh args array for direct spawn — no shell string, no injection surface. */
+export declare function buildGhArgs(tool: ToolDefinition, args: Record<string, unknown>): string[];
 //# sourceMappingURL=schema.d.ts.map

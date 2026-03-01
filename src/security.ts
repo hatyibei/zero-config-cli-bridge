@@ -1,23 +1,35 @@
-const BLOCKED_KEYWORDS = [
-  'create',
-  'delete',
-  'edit',
-  'rm',
-  'update',
-  'close',
-  'reopen',
-  'merge',
-];
+/**
+ * Security layer.
+ *
+ * With direct spawn(bin, args[]) there is no shell to inject into.
+ * This layer provides defense-in-depth by:
+ *   1. Whitelisting the exact subcommand paths allowed to execute.
+ *   2. Validating individual argument values for anomalous content.
+ */
 
-export function validateReadOnly(command: string): void {
-  const lower = command.toLowerCase();
-  for (const keyword of BLOCKED_KEYWORDS) {
-    // Match keyword as a whole word (surrounded by non-alphanumeric chars or at boundaries)
-    const pattern = new RegExp(`(?<![a-z0-9])${keyword}(?![a-z0-9])`);
-    if (pattern.test(lower)) {
-      throw new Error(
-        'Error: Mutating commands are blocked in MVP version. Use read-only commands.'
-      );
+/** Only these gh subcommand paths may execute. */
+const ALLOWED_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'issue list',
+  'pr list',
+]);
+
+export function validateSubcommand(subcommand: string): void {
+  if (!ALLOWED_SUBCOMMANDS.has(subcommand)) {
+    throw new Error(
+      `Error: Subcommand "${subcommand}" is not in the read-only allow-list.`
+    );
+  }
+}
+
+export function validateArgs(args: Record<string, unknown>): void {
+  for (const [, val] of Object.entries(args)) {
+    if (typeof val === 'string') {
+      if (val.includes('\0')) {
+        throw new Error('Error: Null byte detected in argument value.');
+      }
+      if (val.length > 512) {
+        throw new Error('Error: Argument value exceeds maximum length (512).');
+      }
     }
   }
 }
