@@ -1,48 +1,174 @@
-import { createReadStream } from 'fs';
-import { createInterface } from 'readline';
+import { createServer } from 'http';
+import { exec } from 'child_process';
+import { randomBytes } from 'crypto';
+import { readFileSync } from 'fs';
+const APPROVAL_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes — deny on timeout
+function detectPlatform() {
+    if (process.platform === 'darwin')
+        return 'mac';
+    if (process.platform === 'win32')
+        return 'windows';
+    try {
+        const v = readFileSync('/proc/version', 'utf-8').toLowerCase();
+        if (v.includes('microsoft') || v.includes('wsl'))
+            return 'wsl';
+    }
+    catch { /* not Linux or /proc unavailable */ }
+    return 'linux';
+}
+function openBrowser(url) {
+    const p = detectPlatform();
+    // WSL: explorer.exe is the most reliable path to the Windows default browser
+    const cmd = p === 'mac' ? `open '${url}'` :
+        p === 'windows' ? `start "" "${url}"` :
+            p === 'wsl' ? `explorer.exe '${url}'` :
+                `xdg-open '${url}' || sensible-browser '${url}'`;
+    exec(cmd, (err) => {
+        if (err) {
+            process.stderr.write(`\x1b[33mCould not open browser automatically.\x1b[0m\n`);
+        }
+    });
+}
+// ── Port discovery ──────────────────────────────────────────────────────────
+function findFreePort() {
+    return new Promise((resolve, reject) => {
+        const s = createServer();
+        s.listen(0, '127.0.0.1', () => {
+            const addr = s.address();
+            const port = typeof addr === 'object' && addr ? addr.port : null;
+            s.close(() => {
+                if (port)
+                    resolve(port);
+                else
+                    reject(new Error('Could not determine free port'));
+            });
+        });
+        s.on('error', reject);
+    });
+}
+// ── Approval UI ─────────────────────────────────────────────────────────────
+function approvalPage(preview, token) {
+    const safe = preview.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Agent Approval Required</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 640px;
+           margin: 60px auto; padding: 0 24px; color: #1e293b; }
+    h1   { color: #b45309; margin-bottom: 8px; }
+    p    { color: #475569; line-height: 1.6; }
+    pre  { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px;
+           padding: 16px; font-size: 13px; overflow-x: auto; white-space: pre-wrap; }
+    .row { display: flex; gap: 12px; margin-top: 28px; }
+    button { flex: 1; padding: 14px; font-size: 15px; font-weight: 600;
+             border: none; border-radius: 8px; cursor: pointer; transition: opacity .15s; }
+    button:hover { opacity: .82; }
+    .ok  { background: #16a34a; color: #fff; }
+    .no  { background: #dc2626; color: #fff; }
+  </style>
+</head>
+<body>
+  <h1>⚠️ Agent Approval Required</h1>
+  <p>An AI agent is requesting permission to execute a <strong>write operation</strong>
+     using your local GitHub credentials:</p>
+  <pre>${safe}</pre>
+  <p>Approve only if you initiated this action and understand its consequences.</p>
+  <div class="row">
+    <form method="POST" action="/approve/${token}" style="flex:1">
+      <button class="ok" type="submit">✓ Approve</button>
+    </form>
+    <form method="POST" action="/deny/${token}" style="flex:1">
+      <button class="no" type="submit">✗ Deny</button>
+    </form>
+  </div>
+</body>
+</html>`;
+}
+function donePage(approved) {
+    const [icon, color, msg] = approved
+        ? ['✓', '#16a34a', 'Approved — operation is executing.']
+        : ['✗', '#dc2626', 'Denied — operation was cancelled.'];
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Done</title></head>
+<body style="font-family:system-ui;text-align:center;padding:60px;color:${color}">
+<h1 style="font-size:64px;margin:0">${icon}</h1>
+<p style="font-size:20px">${msg}</p>
+<p style="color:#64748b">You can close this tab.</p>
+</body></html>`;
+}
+// ── Public API ──────────────────────────────────────────────────────────────
 /**
- * True server-side Human-in-the-Loop gate.
+ * True server-side Human-in-the-Loop gate for headless MCP environments.
  *
- * The MCP connection stays pending (agent receives nothing) until a human
- * physically types 'y' at the terminal where this server runs.
+ * When Claude Desktop (or any MCP client) spawns this server as a background
+ * process, there is no TTY attached. This function:
+ *   1. Binds a temporary HTTP server on a random localhost port.
+ *   2. Opens the system browser to the approval page.
+ *   3. Blocks until the human clicks Approve or Deny — the MCP response
+ *      is held pending; the agent receives nothing in the meantime.
+ *   4. Denies by default on timeout (2 min) or server error.
  *
- * Uses /dev/tty for input — stdin is occupied by the MCP protocol and must
- * not be consumed. /dev/tty provides direct TTY access regardless of how
- * stdin/stdout are redirected, exactly as sudo(8) and ssh(1) do.
- *
- * If no TTY is available (headless server, CI environment), the request is
- * denied by default — fail-closed, not fail-open.
+ * The one-time token in the URL prevents other localhost processes from
+ * silently approving or denying without user interaction.
  */
 export async function requestApproval(preview) {
-    process.stderr.write('\n\x1b[33m━━━ APPROVAL REQUIRED ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n' +
-        '\x1b[33mAn agent wants to execute a write operation:\x1b[0m\n\n' +
-        `  \x1b[1m${preview}\x1b[0m\n\n` +
-        'Type \x1b[32my\x1b[0m to approve, anything else to deny: ');
+    const token = randomBytes(24).toString('hex');
+    const port = await findFreePort();
+    const base = `http://127.0.0.1:${port}`;
+    const url = `${base}/${token}`;
     return new Promise((resolve) => {
-        let tty = null;
-        try {
-            tty = createReadStream('/dev/tty');
-        }
-        catch {
-            process.stderr.write('\x1b[31mNo TTY available — denied by default.\x1b[0m\n');
-            resolve(false);
-            return;
-        }
-        const rl = createInterface({ input: tty });
-        rl.once('line', (line) => {
-            rl.close();
-            tty?.destroy();
-            const approved = line.trim().toLowerCase() === 'y';
+        let settled = false;
+        const settle = (approved, res) => {
+            if (settled)
+                return;
+            settled = true;
+            if (res) {
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(donePage(approved));
+            }
+            // Give browser time to receive the response page before closing server
+            setTimeout(() => server.close(), 500);
             process.stderr.write(approved
-                ? '\x1b[32m✓ Approved — executing.\x1b[0m\n'
-                : '\x1b[31m✗ Denied — operation cancelled.\x1b[0m\n');
+                ? '\x1b[32m✓ Approved — executing write operation.\x1b[0m\n\n'
+                : '\x1b[31m✗ Denied — write operation cancelled.\x1b[0m\n\n');
             resolve(approved);
+        };
+        const server = createServer((req, res) => {
+            if (req.method === 'GET' && req.url === `/${token}`) {
+                res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end(approvalPage(preview, token));
+                return;
+            }
+            if (req.method === 'POST' && req.url === `/approve/${token}`) {
+                settle(true, res);
+                return;
+            }
+            if (req.method === 'POST' && req.url === `/deny/${token}`) {
+                settle(false, res);
+                return;
+            }
+            res.writeHead(404);
+            res.end();
         });
-        tty.on('error', () => {
-            rl.close();
-            process.stderr.write('\x1b[31mTTY error — denied by default.\x1b[0m\n');
-            resolve(false);
+        server.listen(port, '127.0.0.1', () => {
+            process.stderr.write('\n\x1b[33m━━━ APPROVAL REQUIRED ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\x1b[0m\n' +
+                `\x1b[1m${preview}\x1b[0m\n\n` +
+                `Opening browser for approval…\n` +
+                `If the browser does not open, visit:\n  \x1b[36m${url}\x1b[0m\n` +
+                `Waiting (timeout 2 min — deny on timeout)…\n`);
+            openBrowser(url);
         });
+        server.on('error', (err) => {
+            process.stderr.write(`Approval server error: ${err.message}\n`);
+            settle(false);
+        });
+        setTimeout(() => {
+            if (!settled) {
+                process.stderr.write('\x1b[31mApproval timed out — denied by default.\x1b[0m\n');
+                settle(false);
+            }
+        }, APPROVAL_TIMEOUT_MS);
     });
 }
 //# sourceMappingURL=approval.js.map
